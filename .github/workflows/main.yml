@@ -1,296 +1,149 @@
-name: Run App With Cloudflare Tunnel
+name: GitHub Action + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
-    inputs:
-      start_command:
-        description: "Optional command, e.g. node server.js"
-        required: false
-        default: ""
-      port:
-        description: "Application port"
-        required: false
-        default: "3000"
 
 jobs:
-  run:
+  tunnel:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
-    env:
-      APP_PORT: ${{ github.event.inputs.port }}
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find project
+      - name: Start local web server
         shell: bash
         run: |
           set -e
 
-          echo "Workspace:"
-          pwd
+          echo "Starting Python web server on port 8080..."
 
-          echo
-          echo "Repository contents:"
-          find . -maxdepth 4 -type f | sort
+          nohup python3 -m http.server 8080 \
+            --bind 127.0.0.1 \
+            > server.log 2>&1 &
 
-          echo
-          echo "Searching for package.json..."
+          echo $! > server.pid
 
-          PACKAGE_JSON="$(find . -type f -name package.json -not -path './node_modules/*' | head -n 1 || true)"
+          echo "Server PID: $(cat server.pid)"
 
-          if [ -z "$PACKAGE_JSON" ]; then
-            echo "::error::No package.json was found anywhere in the repository."
-            echo "::error::Your Node.js project files are not in this repository."
-            exit 1
-          fi
+          echo "Waiting for local server..."
 
-          PROJECT_DIR="$(dirname "$PACKAGE_JSON")"
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:8080 \
+              >/dev/null 2>&1; then
 
-          if [ "$PROJECT_DIR" = "." ]; then
-            PROJECT_DIR="."
-          fi
-
-          echo "package.json: $PACKAGE_JSON"
-          echo "Project directory: $PROJECT_DIR"
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Check Cloudflare Tunnel secret
-        shell: bash
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-        run: |
-          set -e
-
-          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
-            echo "::error::CF_TUNNEL_TOKEN secret is missing."
-            exit 1
-          fi
-
-          echo "Cloudflare Tunnel token is present."
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          package-manager-cache: false
-
-      - name: Show Node versions
-        run: |
-          node --version
-          npm --version
-
-      - name: Install dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -e
-
-          if [ -f package-lock.json ]; then
-            echo "package-lock.json found."
-            npm ci
-          else
-            echo "No package-lock.json found."
-            npm install
-          fi
-
-      - name: Detect start command
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        env:
-          CUSTOM_COMMAND: ${{ github.event.inputs.start_command }}
-        run: |
-          set -e
-
-          if [ -n "${CUSTOM_COMMAND:-}" ]; then
-            echo "START_COMMAND=$CUSTOM_COMMAND" >> "$GITHUB_ENV"
-            echo "Using custom command:"
-            echo "$CUSTOM_COMMAND"
-            exit 0
-          fi
-
-          START_SCRIPT="$(node -e '
-            const p=require("./package.json");
-            process.stdout.write((p.scripts && p.scripts.start) || "");
-          ')"
-
-          DEV_SCRIPT="$(node -e '
-            const p=require("./package.json");
-            process.stdout.write((p.scripts && p.scripts.dev) || "");
-          ')"
-
-          if [ -n "$START_SCRIPT" ]; then
-            echo 'START_COMMAND=npm start' >> "$GITHUB_ENV"
-            echo "Using npm start"
-            echo "Script: $START_SCRIPT"
-
-          elif [ -n "$DEV_SCRIPT" ]; then
-            if echo "$DEV_SCRIPT" | grep -qi "vite"; then
-              echo 'START_COMMAND=npm run dev -- --host 0.0.0.0 --port ${APP_PORT}' >> "$GITHUB_ENV"
-              echo "Using Vite dev server"
-            else
-              echo 'START_COMMAND=npm run dev' >> "$GITHUB_ENV"
-              echo "Using npm run dev"
+              echo "Local server is working."
+              exit 0
             fi
 
-          else
-            echo "::error::No start or dev script exists."
-            cat package.json
-            exit 1
-          fi
+            sleep 1
+          done
+
+          echo "ERROR: Local server did not start."
+          cat server.log || true
+          exit 1
 
       - name: Install cloudflared
         shell: bash
         run: |
           set -e
 
-          ARCH="$(uname -m)"
+          echo "Downloading cloudflared..."
 
-          case "$ARCH" in
-            x86_64)
-              URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-              ;;
-            aarch64)
-              URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-              ;;
-            *)
-              echo "::error::Unsupported architecture: $ARCH"
-              exit 1
-              ;;
-          esac
-
-          curl -fL --retry 5 --retry-delay 2 "$URL" -o cloudflared
+          curl -fL --retry 5 --retry-delay 2 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
 
           chmod +x cloudflared
-          sudo install -m 0755 cloudflared /usr/local/bin/cloudflared
+
+          sudo install -m 0755 \
+            cloudflared \
+            /usr/local/bin/cloudflared
+
           rm -f cloudflared
 
+          echo "cloudflared version:"
           cloudflared --version
-
-      - name: Start application
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        env:
-          START_COMMAND: ${{ env.START_COMMAND }}
-          APP_PORT: ${{ env.APP_PORT }}
-        run: |
-          set -e
-
-          echo "Starting:"
-          echo "$START_COMMAND"
-
-          nohup bash -c "$START_COMMAND" \
-            > "$GITHUB_WORKSPACE/app.log" 2>&1 &
-
-          APP_PID=$!
-          echo "$APP_PID" > "$GITHUB_WORKSPACE/app.pid"
-
-          echo "Application PID: $APP_PID"
-          echo "Waiting for port $APP_PORT..."
-
-          for i in $(seq 1 90); do
-
-            if curl -fsS \
-              --max-time 3 \
-              "http://127.0.0.1:$APP_PORT" \
-              >/dev/null 2>&1; then
-
-              echo "Application is ready."
-              exit 0
-            fi
-
-            if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "::error::Application stopped."
-              echo "===== app.log ====="
-              cat "$GITHUB_WORKSPACE/app.log" || true
-              exit 1
-            fi
-
-            sleep 2
-          done
-
-          echo "::error::Application did not respond on port $APP_PORT."
-          echo
-          echo "===== LISTENING PORTS ====="
-          ss -ltnp || true
-
-          echo
-          echo "===== app.log ====="
-          cat "$GITHUB_WORKSPACE/app.log" || true
-
-          exit 1
 
       - name: Start Cloudflare Tunnel
         shell: bash
         env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           set -e
+
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            echo "ERROR: CF_TUNNEL_TOKEN is empty."
+            echo "Add it in GitHub Settings > Secrets and variables > Actions."
+            exit 1
+          fi
 
           echo "Starting Cloudflare Tunnel..."
 
           nohup cloudflared tunnel \
             --no-autoupdate \
             run \
-            --token "$CF_TUNNEL_TOKEN" \
-            > "$GITHUB_WORKSPACE/cloudflared.log" 2>&1 &
+            --token "$TUNNEL_TOKEN" \
+            > cloudflared.log 2>&1 &
 
-          TUNNEL_PID=$!
-          echo "$TUNNEL_PID" > "$GITHUB_WORKSPACE/cloudflared.pid"
+          echo $! > cloudflared.pid
 
-          echo "Tunnel PID: $TUNNEL_PID"
+          echo "Tunnel PID: $(cat cloudflared.pid)"
 
           sleep 10
 
-          if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-            echo "::error::Cloudflare Tunnel stopped."
-            echo "===== cloudflared.log ====="
-            cat "$GITHUB_WORKSPACE/cloudflared.log" || true
+          if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
+            echo "ERROR: Cloudflare Tunnel stopped."
+            echo
+            echo "===== CLOUDFLARED LOG ====="
+            cat cloudflared.log || true
             exit 1
           fi
 
           echo "Cloudflare Tunnel process is running."
 
-      - name: Show logs
+      - name: Check services
+        shell: bash
         run: |
-          echo "===== APP LOG ====="
-          tail -n 50 app.log || true
+          echo "===== LOCAL SERVER ====="
+
+          curl -I \
+            --max-time 10 \
+            http://127.0.0.1:8080 \
+            || true
 
           echo
           echo "===== CLOUDFLARED LOG ====="
-          tail -n 50 cloudflared.log || true
 
-          echo
-          echo "Cloudflare hostname must point to:"
-          echo "http://localhost:${APP_PORT}"
+          tail -n 100 cloudflared.log || true
 
-      - name: Keep services alive
+      - name: Keep alive
         shell: bash
         run: |
           set -e
 
-          APP_PID="$(cat app.pid)"
+          SERVER_PID="$(cat server.pid)"
           TUNNEL_PID="$(cat cloudflared.pid)"
 
-          echo "Application PID: $APP_PID"
+          echo "Server PID: $SERVER_PID"
           echo "Tunnel PID: $TUNNEL_PID"
 
           while true; do
 
-            if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "::error::Application stopped."
-              tail -n 100 app.log || true
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "ERROR: Web server stopped."
+              cat server.log || true
               exit 1
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "::error::Cloudflare Tunnel stopped."
+              echo "ERROR: Cloudflare Tunnel stopped."
               tail -n 100 cloudflared.log || true
               exit 1
             fi
 
             sleep 30
+
           done

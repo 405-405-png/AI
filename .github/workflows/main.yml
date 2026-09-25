@@ -1,0 +1,123 @@
+name: Run App With Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      APP_PORT: 3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Cloudflare Token
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          if [ -z "$CF_TUNNEL_TOKEN" ]; then
+            echo "ERROR: CF_TUNNEL_TOKEN secret is not set."
+            exit 1
+          fi
+          echo "Cloudflare token found."
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Install cloudflared
+        run: |
+          curl -fL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+          cloudflared --version
+
+      - name: Start app
+        run: |
+          nohup npm start > app.log 2>&1 &
+          echo $! > app.pid
+
+          echo "Waiting for app on port $APP_PORT..."
+
+          for i in {1..60}; do
+            if curl -sS --max-time 2 "http://127.0.0.1:$APP_PORT" >/dev/null 2>&1; then
+              echo "App is running."
+              exit 0
+            fi
+
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              echo "App process stopped."
+              echo "===== app.log ====="
+              cat app.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "App did not start on port $APP_PORT."
+          echo "===== app.log ====="
+          cat app.log
+          exit 1
+
+      - name: Start Cloudflare Tunnel
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          nohup cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
+          echo $! > cloudflared.pid
+
+          sleep 10
+
+          if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
+            echo "Cloudflare Tunnel stopped."
+            echo "===== cloudflared.log ====="
+            cat cloudflared.log
+            exit 1
+          fi
+
+          echo "Cloudflare Tunnel is running."
+
+      - name: Show status
+        run: |
+          echo "===== APP LOG ====="
+          tail -n 30 app.log || true
+
+          echo "===== CLOUDFLARED LOG ====="
+          tail -n 30 cloudflared.log || true
+
+      - name: Keep runner alive
+        run: |
+          while true; do
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              echo "App stopped."
+              tail -n 50 app.log
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
+              echo "Cloudflare Tunnel stopped."
+              tail -n 50 cloudflared.log
+              exit 1
+            fi
+
+            sleep 30
+          done

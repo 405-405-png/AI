@@ -1,4 +1,4 @@
-name: GitHub Action + Cloudflare Tunnel
+name: GitHub Actions Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -8,52 +8,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
+    env:
+      APP_PORT: "8080"
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Start local web server
+      - name: Check Cloudflare token
         shell: bash
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Starting Python web server on port 8080..."
+          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+            echo "::error::CF_TUNNEL_TOKEN is empty."
+            echo "Go to:"
+            echo "Settings -> Secrets and variables -> Actions"
+            echo "and create CF_TUNNEL_TOKEN."
+            exit 1
+          fi
 
-          nohup python3 -m http.server 8080 \
-            --bind 127.0.0.1 \
-            > server.log 2>&1 &
-
-          echo $! > server.pid
-
-          echo "Server PID: $(cat server.pid)"
-
-          echo "Waiting for local server..."
-
-          for i in $(seq 1 30); do
-            if curl -fsS \
-              http://127.0.0.1:8080 \
-              >/dev/null 2>&1; then
-
-              echo "Local server is working."
-              exit 0
-            fi
-
-            sleep 1
-          done
-
-          echo "ERROR: Local server did not start."
-          cat server.log || true
-          exit 1
+          echo "Cloudflare token detected."
 
       - name: Install cloudflared
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           echo "Downloading cloudflared..."
 
           curl -fL --retry 5 --retry-delay 2 \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
             -o cloudflared
 
           chmod +x cloudflared
@@ -64,86 +51,195 @@ jobs:
 
           rm -f cloudflared
 
+          echo
           echo "cloudflared version:"
           cloudflared --version
+
+      - name: Start web server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Starting web server on port ${APP_PORT}..."
+
+          nohup python3 -m http.server "${APP_PORT}" \
+            --bind 127.0.0.1 \
+            > server.log 2>&1 &
+
+          SERVER_PID=$!
+          echo "$SERVER_PID" > server.pid
+
+          echo "Server PID: $SERVER_PID"
+
+          echo "Checking local server..."
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              --max-time 3 \
+              "http://127.0.0.1:${APP_PORT}" \
+              >/dev/null; then
+
+              echo "Local server is UP."
+              break
+            fi
+
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::Web server stopped."
+              cat server.log || true
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if ! curl -fsS \
+            --max-time 5 \
+            "http://127.0.0.1:${APP_PORT}" \
+            >/dev/null; then
+
+            echo "::error::Local web server is not responding."
+            echo
+            echo "===== server.log ====="
+            cat server.log || true
+            exit 1
+          fi
+
+          echo "Local server test PASSED."
 
       - name: Start Cloudflare Tunnel
         shell: bash
         env:
-          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          set -e
-
-          if [ -z "$TUNNEL_TOKEN" ]; then
-            echo "ERROR: CF_TUNNEL_TOKEN is empty."
-            echo "Add it in GitHub Settings > Secrets and variables > Actions."
-            exit 1
-          fi
+          set -euo pipefail
 
           echo "Starting Cloudflare Tunnel..."
 
+          rm -f cloudflared.log
+
           nohup cloudflared tunnel \
             --no-autoupdate \
+            --loglevel info \
+            --logfile "$GITHUB_WORKSPACE/cloudflared.log" \
             run \
-            --token "$TUNNEL_TOKEN" \
-            > cloudflared.log 2>&1 &
+            --token "$CF_TUNNEL_TOKEN" \
+            >/dev/null 2>&1 &
 
-          echo $! > cloudflared.pid
+          TUNNEL_PID=$!
+          echo "$TUNNEL_PID" > tunnel.pid
 
-          echo "Tunnel PID: $(cat cloudflared.pid)"
+          echo "Tunnel PID: $TUNNEL_PID"
 
-          sleep 10
+          echo
+          echo "Waiting for Cloudflare connection..."
 
-          if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
-            echo "ERROR: Cloudflare Tunnel stopped."
-            echo
-            echo "===== CLOUDFLARED LOG ====="
-            cat cloudflared.log || true
-            exit 1
+          CONNECTED=0
+
+          for i in $(seq 1 30); do
+
+            if grep -qiE \
+              "Registered tunnel connection|registered connection|connection.*registered" \
+              cloudflared.log 2>/dev/null; then
+
+              CONNECTED=1
+              break
+            fi
+
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "::error::Cloudflare Tunnel stopped."
+              echo
+              echo "===== cloudflared.log ====="
+              cat cloudflared.log || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ "$CONNECTED" -eq 1 ]; then
+            echo "Cloudflare Tunnel CONNECTED."
+          else
+            echo "Tunnel process is still running."
+            echo "Cloudflare registration message was not detected yet."
           fi
-
-          echo "Cloudflare Tunnel process is running."
-
-      - name: Check services
-        shell: bash
-        run: |
-          echo "===== LOCAL SERVER ====="
-
-          curl -I \
-            --max-time 10 \
-            http://127.0.0.1:8080 \
-            || true
 
           echo
           echo "===== CLOUDFLARED LOG ====="
+          cat cloudflared.log || true
 
-          tail -n 100 cloudflared.log || true
-
-      - name: Keep alive
+      - name: Verify everything
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           SERVER_PID="$(cat server.pid)"
-          TUNNEL_PID="$(cat cloudflared.pid)"
+          TUNNEL_PID="$(cat tunnel.pid)"
 
           echo "Server PID: $SERVER_PID"
           echo "Tunnel PID: $TUNNEL_PID"
 
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "::error::Server is not running."
+            exit 1
+          fi
+
+          if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            echo "::error::Tunnel is not running."
+            echo
+            echo "===== cloudflared.log ====="
+            cat cloudflared.log || true
+            exit 1
+          fi
+
+          echo
+          echo "================================"
+          echo "SERVER:  RUNNING"
+          echo "TUNNEL:  RUNNING"
+          echo "PORT:    ${APP_PORT}"
+          echo "================================"
+
+      - name: Keep services alive and show logs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SERVER_PID="$(cat server.pid)"
+          TUNNEL_PID="$(cat tunnel.pid)"
+
+          echo "Services are now running."
+          echo
+          echo "Your Cloudflare hostname must be configured in Cloudflare"
+          echo "to forward to:"
+          echo
+          echo "http://localhost:${APP_PORT}"
+          echo
+          echo "===== LIVE CLOUDFLARE LOG ====="
+
           while true; do
 
             if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-              echo "ERROR: Web server stopped."
+              echo
+              echo "::error::Web server stopped."
+              echo
+              echo "===== server.log ====="
               cat server.log || true
               exit 1
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel stopped."
-              tail -n 100 cloudflared.log || true
+              echo
+              echo "::error::Cloudflare Tunnel stopped."
+              echo
+              echo "===== cloudflared.log ====="
+              cat cloudflared.log || true
               exit 1
             fi
 
-            sleep 30
+            tail -n 20 cloudflared.log || true
 
+            echo
+            echo "----- still running -----"
+            date
+
+            sleep 30
           done

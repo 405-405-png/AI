@@ -2,6 +2,11 @@ name: Run App With Cloudflare Tunnel
 
 on:
   workflow_dispatch:
+    inputs:
+      start_command:
+        description: "Optional custom start command (e.g. 'node server.js'). Leave empty for auto-detect."
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -10,6 +15,9 @@ jobs:
 
     env:
       APP_PORT: "3000"
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      START_COMMAND: ${{ github.event.inputs.start_command }}
 
     steps:
       - name: Checkout repository
@@ -19,22 +27,14 @@ jobs:
         shell: bash
         run: |
           set -e
-
-          echo "Workspace:"
-          pwd
-
+          echo "Workspace: $(pwd)"
           echo
-          echo "Files:"
           ls -la
-
           echo
-          echo "Checking package.json..."
-
           if [ ! -f package.json ]; then
-            echo "ERROR: package.json was not found."
+            echo "::error::package.json was not found in repository root."
             exit 1
           fi
-
           echo "package.json found."
 
       - name: Check Cloudflare Tunnel Secret
@@ -43,20 +43,16 @@ jobs:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           set -e
-
-          if [ -z "$CF_TUNNEL_TOKEN" ]; then
-            echo "ERROR: CF_TUNNEL_TOKEN is empty."
-            echo "Create this GitHub Actions secret first."
+          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+            echo "::error::Secret CF_TUNNEL_TOKEN is empty. Add it in Settings > Secrets and variables > Actions."
             exit 1
           fi
-
           echo "Cloudflare Tunnel secret is present."
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
-          package-manager-cache: false
 
       - name: Show Node and npm versions
         shell: bash
@@ -68,13 +64,14 @@ jobs:
         shell: bash
         run: |
           set -e
-
           if [ -f package-lock.json ]; then
-            echo "package-lock.json found."
-            npm ci
+            echo "package-lock.json found -> trying npm ci"
+            if ! npm ci; then
+              echo "::warning::npm ci failed (lockfile out of sync?). Falling back to npm install."
+              npm install
+            fi
           else
-            echo "No package-lock.json found."
-            echo "Using npm install..."
+            echo "No package-lock.json -> npm install"
             npm install
           fi
 
@@ -91,29 +88,17 @@ jobs:
         shell: bash
         run: |
           set -e
-
           ARCH="$(uname -m)"
-
-          if [ "$ARCH" = "x86_64" ]; then
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-          elif [ "$ARCH" = "aarch64" ]; then
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-          else
-            echo "Unsupported architecture: $ARCH"
-            exit 1
-          fi
-
+          case "$ARCH" in
+            x86_64)  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+            aarch64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+            *) echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
           echo "Downloading cloudflared for $ARCH..."
-
-          curl -fL --retry 5 --retry-delay 2 \
-            "$URL" \
-            -o cloudflared
-
+          curl -fL --retry 5 --retry-delay 2 "$URL" -o cloudflared
           chmod +x cloudflared
           sudo install -m 0755 cloudflared /usr/local/bin/cloudflared
-
           rm -f cloudflared
-
           cloudflared --version
 
       - name: Start application
@@ -121,47 +106,64 @@ jobs:
         run: |
           set -e
 
-          echo "Starting application..."
+          # ---------- Decide how to start the app ----------
+          get_script() {
+            node -e 'const s=(require("./package.json").scripts||{})[process.argv[1]]; if(s) process.stdout.write(s)' "$1"
+          }
 
-          if npm run | grep -qE '^  start'; then
-            echo "Using: npm start"
-            nohup npm start > app.log 2>&1 &
-          elif npm run | grep -qE '^  dev'; then
-            echo "Using: npm run dev"
-            nohup npm run dev -- --host 0.0.0.0 --port "$APP_PORT" > app.log 2>&1 &
+          if [ -n "${START_COMMAND:-}" ]; then
+            CMD="$START_COMMAND"
+            echo "Using custom START_COMMAND: $CMD"
+          elif [ -n "$(get_script start)" ]; then
+            CMD="npm start"
+            echo "Using: npm start  ->  $(get_script start)"
+          elif [ -n "$(get_script dev)" ]; then
+            DEV_SCRIPT="$(get_script dev)"
+            if echo "$DEV_SCRIPT" | grep -qiE '(^|[[:space:]/])vite([[:space:]]|$)'; then
+              CMD="npm run dev -- --host 0.0.0.0 --port $APP_PORT"
+            else
+              CMD="npm run dev"
+            fi
+            echo "Using: $CMD  ->  $DEV_SCRIPT"
           else
-            echo "ERROR: Neither 'start' nor 'dev' script exists in package.json."
-            echo "===== package.json ====="
+            echo "::error::Neither 'start' nor 'dev' script exists in package.json and no START_COMMAND provided."
             cat package.json
             exit 1
           fi
 
+          # ---------- Start in background (survives across steps) ----------
+          echo "Starting application on port $APP_PORT ..."
+          setsid nohup bash -c "$CMD" > app.log 2>&1 &
           APP_PID=$!
+          disown "$APP_PID" || true
           echo "$APP_PID" > app.pid
-
           echo "Application PID: $APP_PID"
-          echo "Waiting for application on port $APP_PORT..."
 
-          for i in {1..90}; do
-            if curl -sS --max-time 3 \
-              "http://127.0.0.1:$APP_PORT" \
-              >/dev/null 2>&1; then
-
-              echo "Application is responding."
+          # ---------- Wait for the port ----------
+          echo "Waiting for application on port $APP_PORT ..."
+          for i in $(seq 1 90); do
+            if ss -ltn 2>/dev/null | grep -qE "[:.]$APP_PORT[[:space:]]" \
+               || curl -s --max-time 3 "http://127.0.0.1:$APP_PORT" >/dev/null 2>&1 \
+               || curl -s --max-time 3 "http://localhost:$APP_PORT" >/dev/null 2>&1; then
+              echo "Application is listening on port $APP_PORT."
+              echo "===== app.log (head) ====="
+              tail -n 30 app.log || true
               exit 0
             fi
 
             if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "ERROR: Application stopped unexpectedly."
+              echo "::error::Application process exited unexpectedly."
               echo "===== app.log ====="
               cat app.log || true
               exit 1
             fi
-
             sleep 2
           done
 
-          echo "ERROR: Application did not respond on port $APP_PORT."
+          echo "::error::Application did not open port $APP_PORT within 180s."
+          echo
+          echo "Currently listening ports (maybe your app uses a different port -> change APP_PORT):"
+          ss -ltnp 2>/dev/null || true
           echo
           echo "===== app.log ====="
           cat app.log || true
@@ -173,30 +175,33 @@ jobs:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           set -e
-
           echo "Starting Cloudflare Tunnel..."
-
-          nohup cloudflared tunnel \
-            --no-autoupdate \
-            run \
-            --token "$CF_TUNNEL_TOKEN" \
+          setsid nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" \
             > cloudflared.log 2>&1 &
-
           TUNNEL_PID=$!
+          disown "$TUNNEL_PID" || true
           echo "$TUNNEL_PID" > cloudflared.pid
-
           echo "Tunnel PID: $TUNNEL_PID"
 
-          sleep 10
+          # wait for a registered connection
+          for i in $(seq 1 30); do
+            if grep -qiE "Registered tunnel connection|Connection .* registered" cloudflared.log 2>/dev/null; then
+              echo "Cloudflare Tunnel connected."
+              break
+            fi
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "::error::Cloudflare Tunnel exited. Check that CF_TUNNEL_TOKEN is a valid *tunnel token*."
+              cat cloudflared.log || true
+              exit 1
+            fi
+            sleep 2
+          done
 
           if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-            echo "ERROR: Cloudflare Tunnel stopped."
-            echo
-            echo "===== cloudflared.log ====="
+            echo "::error::Cloudflare Tunnel stopped."
             cat cloudflared.log || true
             exit 1
           fi
-
           echo "Cloudflare Tunnel is running."
 
       - name: Show connection logs
@@ -204,31 +209,29 @@ jobs:
         run: |
           echo "===== APPLICATION LOG ====="
           tail -n 50 app.log || true
-
           echo
           echo "===== CLOUDFLARED LOG ====="
           tail -n 50 cloudflared.log || true
+          echo
+          echo "NOTE: Public URL = the Public Hostname you configured for this tunnel in Cloudflare Zero Trust."
+          echo "      Its service must point to: http://localhost:${APP_PORT}"
 
       - name: Keep services alive
         shell: bash
         run: |
-          set -e
-
+          APP_PID="$(cat app.pid)"
+          TUNNEL_PID="$(cat cloudflared.pid)"
+          echo "Keeping services alive (job will stop at timeout-minutes)..."
           while true; do
-
-            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
-              echo "ERROR: Application stopped."
-              echo "===== app.log ====="
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "::error::Application stopped."
               tail -n 100 app.log || true
               exit 1
             fi
-
-            if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel stopped."
-              echo "===== cloudflared.log ====="
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "::error::Cloudflare Tunnel stopped."
               tail -n 100 cloudflared.log || true
               exit 1
             fi
-
             sleep 30
           done

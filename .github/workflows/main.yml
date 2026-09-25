@@ -2,6 +2,15 @@ name: Run App With Cloudflare Tunnel
 
 on:
   workflow_dispatch:
+    inputs:
+      start_command:
+        description: "Optional command, e.g. node server.js"
+        required: false
+        default: ""
+      port:
+        description: "Application port"
+        required: false
+        default: "3000"
 
 jobs:
   run:
@@ -9,11 +18,10 @@ jobs:
     timeout-minutes: 350
 
     env:
-      PORT: "3000"
-      HOST: "0.0.0.0"
+      APP_PORT: ${{ github.event.inputs.port }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Find project
@@ -21,53 +29,59 @@ jobs:
         run: |
           set -e
 
-          echo "Current directory:"
+          echo "Workspace:"
           pwd
 
           echo
-          echo "Repository files:"
-          find . -maxdepth 3 -type f | sort
+          echo "Repository contents:"
+          find . -maxdepth 4 -type f | sort
 
           echo
           echo "Searching for package.json..."
 
-          PACKAGE_JSON="$(find . -type f -name package.json | head -n 1 || true)"
+          PACKAGE_JSON="$(find . -type f -name package.json -not -path './node_modules/*' | head -n 1 || true)"
 
           if [ -z "$PACKAGE_JSON" ]; then
-            echo "::error::No package.json found anywhere in the repository."
-            echo "::error::Upload/push your Node.js project files to the repository first."
+            echo "::error::No package.json was found anywhere in the repository."
+            echo "::error::Your Node.js project files are not in this repository."
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PACKAGE_JSON")"
 
-          echo "Found package.json:"
-          echo "$PACKAGE_JSON"
+          if [ "$PROJECT_DIR" = "." ]; then
+            PROJECT_DIR="."
+          fi
 
-          echo "Project directory:"
-          echo "$PROJECT_DIR"
+          echo "package.json: $PACKAGE_JSON"
+          echo "Project directory: $PROJECT_DIR"
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      - name: Check Cloudflare Secret
+      - name: Check Cloudflare Tunnel secret
         shell: bash
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           set -e
 
-          if [ -z "$CF_TUNNEL_TOKEN" ]; then
+          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
             echo "::error::CF_TUNNEL_TOKEN secret is missing."
             exit 1
           fi
 
-          echo "Cloudflare secret found."
+          echo "Cloudflare Tunnel token is present."
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           package-manager-cache: false
+
+      - name: Show Node versions
+        run: |
+          node --version
+          npm --version
 
       - name: Install dependencies
         working-directory: ${{ env.PROJECT_DIR }}
@@ -76,9 +90,56 @@ jobs:
           set -e
 
           if [ -f package-lock.json ]; then
+            echo "package-lock.json found."
             npm ci
           else
+            echo "No package-lock.json found."
             npm install
+          fi
+
+      - name: Detect start command
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          CUSTOM_COMMAND: ${{ github.event.inputs.start_command }}
+        run: |
+          set -e
+
+          if [ -n "${CUSTOM_COMMAND:-}" ]; then
+            echo "START_COMMAND=$CUSTOM_COMMAND" >> "$GITHUB_ENV"
+            echo "Using custom command:"
+            echo "$CUSTOM_COMMAND"
+            exit 0
+          fi
+
+          START_SCRIPT="$(node -e '
+            const p=require("./package.json");
+            process.stdout.write((p.scripts && p.scripts.start) || "");
+          ')"
+
+          DEV_SCRIPT="$(node -e '
+            const p=require("./package.json");
+            process.stdout.write((p.scripts && p.scripts.dev) || "");
+          ')"
+
+          if [ -n "$START_SCRIPT" ]; then
+            echo 'START_COMMAND=npm start' >> "$GITHUB_ENV"
+            echo "Using npm start"
+            echo "Script: $START_SCRIPT"
+
+          elif [ -n "$DEV_SCRIPT" ]; then
+            if echo "$DEV_SCRIPT" | grep -qi "vite"; then
+              echo 'START_COMMAND=npm run dev -- --host 0.0.0.0 --port ${APP_PORT}' >> "$GITHUB_ENV"
+              echo "Using Vite dev server"
+            else
+              echo 'START_COMMAND=npm run dev' >> "$GITHUB_ENV"
+              echo "Using npm run dev"
+            fi
+
+          else
+            echo "::error::No start or dev script exists."
+            cat package.json
+            exit 1
           fi
 
       - name: Install cloudflared
@@ -86,50 +147,80 @@ jobs:
         run: |
           set -e
 
-          curl -fL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o cloudflared
+          ARCH="$(uname -m)"
+
+          case "$ARCH" in
+            x86_64)
+              URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+              ;;
+            aarch64)
+              URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+              ;;
+            *)
+              echo "::error::Unsupported architecture: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          curl -fL --retry 5 --retry-delay 2 "$URL" -o cloudflared
 
           chmod +x cloudflared
           sudo install -m 0755 cloudflared /usr/local/bin/cloudflared
+          rm -f cloudflared
 
           cloudflared --version
 
       - name: Start application
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
+        env:
+          START_COMMAND: ${{ env.START_COMMAND }}
+          APP_PORT: ${{ env.APP_PORT }}
         run: |
           set -e
 
-          echo "Starting application..."
+          echo "Starting:"
+          echo "$START_COMMAND"
 
-          if npm run | grep -q "start"; then
-            nohup npm start > "$GITHUB_WORKSPACE/app.log" 2>&1 &
-          elif npm run | grep -q "dev"; then
-            nohup npm run dev -- --host 0.0.0.0 --port "$PORT" \
-              > "$GITHUB_WORKSPACE/app.log" 2>&1 &
-          else
-            echo "::error::No start or dev script found in package.json."
-            cat package.json
-            exit 1
-          fi
+          nohup bash -c "$START_COMMAND" \
+            > "$GITHUB_WORKSPACE/app.log" 2>&1 &
 
-          echo $! > "$GITHUB_WORKSPACE/app.pid"
+          APP_PID=$!
+          echo "$APP_PID" > "$GITHUB_WORKSPACE/app.pid"
 
-          echo "Waiting for app on port $PORT..."
+          echo "Application PID: $APP_PID"
+          echo "Waiting for port $APP_PORT..."
 
-          for i in {1..60}; do
-            if curl -fsS "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
-              echo "Application is running."
+          for i in $(seq 1 90); do
+
+            if curl -fsS \
+              --max-time 3 \
+              "http://127.0.0.1:$APP_PORT" \
+              >/dev/null 2>&1; then
+
+              echo "Application is ready."
               exit 0
+            fi
+
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "::error::Application stopped."
+              echo "===== app.log ====="
+              cat "$GITHUB_WORKSPACE/app.log" || true
+              exit 1
             fi
 
             sleep 2
           done
 
-          echo "::error::Application did not start."
+          echo "::error::Application did not respond on port $APP_PORT."
+          echo
+          echo "===== LISTENING PORTS ====="
+          ss -ltnp || true
+
+          echo
           echo "===== app.log ====="
           cat "$GITHUB_WORKSPACE/app.log" || true
+
           exit 1
 
       - name: Start Cloudflare Tunnel
@@ -139,38 +230,65 @@ jobs:
         run: |
           set -e
 
+          echo "Starting Cloudflare Tunnel..."
+
           nohup cloudflared tunnel \
             --no-autoupdate \
             run \
             --token "$CF_TUNNEL_TOKEN" \
             > "$GITHUB_WORKSPACE/cloudflared.log" 2>&1 &
 
-          echo $! > "$GITHUB_WORKSPACE/cloudflared.pid"
+          TUNNEL_PID=$!
+          echo "$TUNNEL_PID" > "$GITHUB_WORKSPACE/cloudflared.pid"
+
+          echo "Tunnel PID: $TUNNEL_PID"
 
           sleep 10
 
-          if ! kill -0 "$(cat "$GITHUB_WORKSPACE/cloudflared.pid")" 2>/dev/null; then
+          if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
             echo "::error::Cloudflare Tunnel stopped."
             echo "===== cloudflared.log ====="
             cat "$GITHUB_WORKSPACE/cloudflared.log" || true
             exit 1
           fi
 
-          echo "Cloudflare Tunnel is running."
+          echo "Cloudflare Tunnel process is running."
 
-      - name: Keep alive
+      - name: Show logs
+        run: |
+          echo "===== APP LOG ====="
+          tail -n 50 app.log || true
+
+          echo
+          echo "===== CLOUDFLARED LOG ====="
+          tail -n 50 cloudflared.log || true
+
+          echo
+          echo "Cloudflare hostname must point to:"
+          echo "http://localhost:${APP_PORT}"
+
+      - name: Keep services alive
         shell: bash
         run: |
+          set -e
+
+          APP_PID="$(cat app.pid)"
+          TUNNEL_PID="$(cat cloudflared.pid)"
+
+          echo "Application PID: $APP_PID"
+          echo "Tunnel PID: $TUNNEL_PID"
+
           while true; do
-            if ! kill -0 "$(cat "$GITHUB_WORKSPACE/app.pid")" 2>/dev/null; then
+
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
               echo "::error::Application stopped."
-              cat "$GITHUB_WORKSPACE/app.log" || true
+              tail -n 100 app.log || true
               exit 1
             fi
 
-            if ! kill -0 "$(cat "$GITHUB_WORKSPACE/cloudflared.pid")" 2>/dev/null; then
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
               echo "::error::Cloudflare Tunnel stopped."
-              cat "$GITHUB_WORKSPACE/cloudflared.log" || true
+              tail -n 100 cloudflared.log || true
               exit 1
             fi
 
